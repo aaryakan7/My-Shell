@@ -1,49 +1,31 @@
-**Authors:**
-Aarya Kansara, Subham Jena
+CS 214 Spring 2025 - Project III: My Shell
 
-**Overview:**
+Authors
+Aarya Kansara (ak2397)
+Subham Jena (sj1097)
 
-This project implements a simple command‐line shell, mysh, written in C. The shell supports both interactive mode (with prompts and welcome/goodbye messages) and batch mode (reading commands from a file or via stdin). It handles standard features including tokenization, command parsing, input/output redirection, pipelines (supporting up to two processes), conditional execution using the keywords and and or, and wildcard expansion. Built-in commands include cd, pwd, which, exit, and die. For external commands provided by bare names, the shell searches designated directories (namely /usr/local/bin, /usr/bin, and /bin) to find an executable.
+mysh is a C shell that runs one command per line. It can read commands from a file or standard input, and it has an interactive prompt when run in a terminal.
 
-**Test Plan & Directory Setup:**
+Commands and features
+- Built-ins: cd, pwd, which, exit, and die
+- External commands found by path or searched in /usr/local/bin, /usr/bin, and /bin
+- Input and output redirection with < and >
+- Pipelines with two commands
+- Conditional commands using and and or
+- Wildcard expansion for one * in the final path segment
+- Comments starting at # and continuing to the end of the line
 
-Our testing verifies that the shell correctly distinguishes interactive from batch modes, processes commands and comments, handles both built-in and external commands (along with proper path resolution using our find_executable function), and correctly supports redirection, pipelines, conditionals, and wildcard expansion. For example, running echo hello | exit should print “hello” and then display a goodbye message before terminating. We confirmed that commands like cd change directories and that tokens including wildcards (e.g., *.txt) expand as expected.
+Separate <, >, and | from other tokens with whitespace. This shell does not support quoted strings or >>. A pipeline succeeds when its last command succeeds.
 
-To test the shell, we set up a directory structure similar to the following within the PA3 folder:
-<pre>
-/common/home/ak2397/Documents/P3/
-├── mysh.c
-├── Makefile
-├── test.sh           # batch file for testing
-├── input.txt         # Contains test input lines
-├── output.txt        # Output file created by redirection tests
-├── sorted.txt        # Output file for sorted results
-├── sorted_output.txt # Alternative output file for pipeline redirection
-├── file1.txt         # For wildcard test: simple file
-├── file2.txt         # For wildcard test: simple file
-├── a.txt             # For multiple wildcard tests
-├── b.txt             # For multiple wildcard tests
-├── x.log             # For multiple wildcard tests
-├── y.log             # For multiple wildcard tests
-├── .hiddenfile       # Hidden file for wildcard tests
-├── visiblefile       # Visible file for wildcard tests
-├── testdir/          # Subdirectory for testing 'cd' command
-├── nodir/            # Directory for redirection error test; set as read-only
-│   └── (empty)
-└── sub/              # Subdirectory for wildcard path tests
-    ├── a.c           # Source file for wildcard expansion tests
-    └── b.c           # Source file for wildcard expansion tests
-</pre>
-**Execution:**
+Build and run
+Run make to build mysh.
+Run ./mysh for interactive mode.
+Run ./mysh commands.txt to read commands from a file.
+Run ./mysh < commands.txt to read commands from standard input.
 
-To build the shell, run the command "make" in your terminal
+Testing
+Run make test to build mysh and run the checks. The test script creates its own files and directories, and make test runs it in a temporary directory. It checks redirection, pipelines, conditionals, syntax errors, comments, wildcards, and exit behavior.
 
-For interactive mode, run "./mysh"
-Setup file directory as described above, or edit the test.sh file.
+Run ./mysh test.sh to run the test script manually. It creates its fixtures in the current directory.
 
-You will see a welcome message and a prompt (mysh>). Enter commands (e.g. pwd, cd subdir, etc.) and type exit to quit (printing a goodbye message).
-For batch mode, you can run a test script. For example, if you created test_all.sh containing multiple commands (ensure it ends with an exit), run:
-
-./mysh < test.sh
-
-The shell will execute all the commands in the script (without extra prompts) and then terminate.
+Built-ins in a pipeline run in a child process, so cd in a pipeline does not change the shell's working directory. exit ignores its input; for example, echo hello | exit ends the shell after the pipeline but does not print hello to the terminal.

@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <dirent.h>
+#include <sys/types.h>
 
 #define MAX_LINE 1024
 #define MAX_TOKENS 100
@@ -21,6 +22,8 @@ typedef struct command {
     char *args[MAX_ARGS];  // Argument list for execv (NULL terminated)
     char *input_file;      // For input redirection (if any)
     char *output_file;     // For output redirection (if any)
+    char *owned_args[MAX_ARGS];
+    int owned_count;
 } command;
 
 // Function Prototypes
@@ -31,6 +34,14 @@ void run_shell(FILE *input_stream, int interactive);
 void trim_newline(char *str);
 void tokenize_line(char *line, char *tokens[], int *num_tokens);
 int expand_token(const char *token, char *expanded_tokens[], int max_expanded);
+static int read_command_line(int fd, char *line, size_t size);
+static int append_arg(command *cmd, char *arg, int *index, int owned);
+static int close_child_stdin = 0;
+static int redirect_builtin(const command *cmd, int saved[2]);
+static void restore_builtin(int saved[2]);
+static void free_command(command *cmd);
+static int run_builtin(command *cmd);
+static int is_builtin(const char *name);
 
 /*
  * If the token contains an asterisk (*), expand it to match files in the directory.
@@ -147,6 +158,9 @@ int main(int argc, char *argv[]) {
 void run_shell(FILE *input_stream, int interactive) {
     char line[MAX_LINE];
     int prev_exit_status = 0;
+    int has_previous_command = 0;
+    int input_fd = fileno(input_stream);
+    close_child_stdin = !isatty(input_fd);
     
     if (interactive) {
         printf("Welcome to my shell!\n");
@@ -158,7 +172,14 @@ void run_shell(FILE *input_stream, int interactive) {
             fflush(stdout);
         }
         
-        if (fgets(line, sizeof(line), input_stream) == NULL) {
+        int read_result = read_command_line(input_fd, line, sizeof(line));
+        if (read_result == -2) {
+            fprintf(stderr, "Syntax error: command line too long\n");
+            prev_exit_status = 1;
+            has_previous_command = 1;
+            continue;
+        }
+        if (read_result <= 0) {
             break;
         }
         
@@ -170,25 +191,52 @@ void run_shell(FILE *input_stream, int interactive) {
         char *tokens[MAX_TOKENS];
         int num_tokens = 0;
         tokenize_line(line, tokens, &num_tokens);
+        if (num_tokens == MAX_TOKENS) {
+            fprintf(stderr, "Syntax error: too many tokens\n");
+            prev_exit_status = 1;
+            has_previous_command = 1;
+            continue;
+        }
         if (num_tokens == 0) {
             continue;
         }
+
+        int conditional = strcmp(tokens[0], "and") == 0 || strcmp(tokens[0], "or") == 0;
+        if (conditional && !has_previous_command) {
+            fprintf(stderr, "Syntax error: conditional cannot start the input\n");
+            prev_exit_status = 1;
+            has_previous_command = 1;
+            continue;
+        }
+        has_previous_command = 1;
         
-        // Check syntax: redirection tokens must have a following token.
+        // Check syntax before constructing commands.
         int syntax_error = 0;
         for (int i = 0; i < num_tokens; i++) {
-            if ((strcmp(tokens[i], "<") == 0 || strcmp(tokens[i], ">") == 0) && (i + 1 >= num_tokens)) {
+            if (strcmp(tokens[i], "|") == 0 && (i == 0 || i == num_tokens - 1 || (i + 1 < num_tokens && strcmp(tokens[i + 1], "|") == 0))) {
+                fprintf(stderr, "Syntax error near '|\n");
+                syntax_error = 1;
+                break;
+            }
+            if ((strcmp(tokens[i], "<") == 0 || strcmp(tokens[i], ">") == 0) &&
+                (i + 1 >= num_tokens || strcmp(tokens[i + 1], "<") == 0 || strcmp(tokens[i + 1], ">") == 0 || strcmp(tokens[i + 1], "|") == 0)) {
                 fprintf(stderr, "Syntax error: expected filename after '%s'\n", tokens[i]);
                 syntax_error = 1;
                 break;
             }
         }
         if (syntax_error) {
+            prev_exit_status = 1;
             continue;
         }
         
         // Handle conditionals: "and" and "or".
         if (strcmp(tokens[0], "and") == 0) {
+            if (num_tokens == 1) {
+                fprintf(stderr, "Syntax error: expected command after 'and'\n");
+                prev_exit_status = 1;
+                continue;
+            }
             for (int i = 0; i < num_tokens - 1; i++) {
                 tokens[i] = tokens[i+1];
             }
@@ -197,6 +245,11 @@ void run_shell(FILE *input_stream, int interactive) {
                 continue;
             }
         } else if (strcmp(tokens[0], "or") == 0) {
+            if (num_tokens == 1) {
+                fprintf(stderr, "Syntax error: expected command after 'or'\n");
+                prev_exit_status = 1;
+                continue;
+            }
             for (int i = 0; i < num_tokens - 1; i++) {
                 tokens[i] = tokens[i+1];
             }
@@ -210,10 +263,14 @@ void run_shell(FILE *input_stream, int interactive) {
         int pipe_index = -1;
         for (int i = 0; i < num_tokens; i++) {
             if (strcmp(tokens[i], "|") == 0) {
+                if (pipe_index != -1) {
+                    syntax_error = 1;
+                    break;
+                }
                 pipe_index = i;
-                break;
             }
         }
+        if (syntax_error) { prev_exit_status = 1; continue; }
         
         // Prepare command structures.
         command cmd1;
@@ -233,11 +290,15 @@ void run_shell(FILE *input_stream, int interactive) {
                 if (strchr(tokens[i], '*') != NULL) {
                     char *expanded[100];
                     int num_expanded = expand_token(tokens[i], expanded, 100);
-                    for (int j = 0; j < num_expanded && arg_index < MAX_ARGS - 1; j++) {
-                        cmd1.args[arg_index++] = expanded[j];
+                    for (int j = 0; j < num_expanded; j++) {
+                        if (!append_arg(&cmd1, expanded[j], &arg_index, 1)) {
+                            for (int k = j; k < num_expanded; k++) free(expanded[k]);
+                            syntax_error = 1;
+                            break;
+                        }
                     }
                 } else {
-                    cmd1.args[arg_index++] = tokens[i];
+                    if (!append_arg(&cmd1, tokens[i], &arg_index, 0)) syntax_error = 1;
                 }
             }
         }
@@ -255,110 +316,70 @@ void run_shell(FILE *input_stream, int interactive) {
                     if (strchr(tokens[i], '*') != NULL) {
                         char *expanded[100];
                         int num_expanded = expand_token(tokens[i], expanded, 100);
-                        for (int j = 0; j < num_expanded && arg_index < MAX_ARGS - 1; j++) {
-                            cmd2.args[arg_index++] = expanded[j];
+                        for (int j = 0; j < num_expanded; j++) {
+                            if (!append_arg(&cmd2, expanded[j], &arg_index, 1)) {
+                                for (int k = j; k < num_expanded; k++) free(expanded[k]);
+                                syntax_error = 1;
+                                break;
+                            }
                         }
                     } else {
-                        cmd2.args[arg_index++] = tokens[i];
+                        if (!append_arg(&cmd2, tokens[i], &arg_index, 0)) syntax_error = 1;
                     }
                 }
             }
             cmd2.args[arg_index] = NULL;
         }
-        
-        if (cmd1.args[0] == NULL) {
+        if (syntax_error) {
+            fprintf(stderr, "Syntax error: too many arguments\n");
+            prev_exit_status = 1;
+            free_command(&cmd1);
+            free_command(&cmd2);
             continue;
         }
         
-        /* Handle built-ins for non-pipeline commands. */
-        if (pipe_index == -1) {
-            if (strcmp(cmd1.args[0], "cd") == 0) {
-                if (cmd1.args[1] == NULL || cmd1.args[2] != NULL) {
-                    fprintf(stderr, "cd: requires one argument\n");
-                    prev_exit_status = 1;
-                } else {
-                    if (chdir(cmd1.args[1]) != 0) {
-                        perror("cd");
-                        prev_exit_status = 1;
-                    } else {
-                        prev_exit_status = 0;
-                    }
-                }
-                continue;
-            }
-            if (strcmp(cmd1.args[0], "pwd") == 0) {
-                char cwd[1024];
-                if (getcwd(cwd, sizeof(cwd)) == NULL) {
-                    perror("pwd");
-                    prev_exit_status = 1;
-                } else {
-                    printf("%s\n", cwd);
-                    prev_exit_status = 0;
-                }
-                continue;
-            }
-            if (strcmp(cmd1.args[0], "which") == 0) {
-                if (cmd1.args[1] == NULL || cmd1.args[2] != NULL) {
-                    fprintf(stderr, "which: requires one argument\n");
-                    prev_exit_status = 1;
-                } else {
-                    if (strcmp(cmd1.args[1], "cd") == 0 ||
-                        strcmp(cmd1.args[1], "pwd") == 0 ||
-                        strcmp(cmd1.args[1], "which") == 0 ||
-                        strcmp(cmd1.args[1], "exit") == 0 ||
-                        strcmp(cmd1.args[1], "die") == 0) {
-                        fprintf(stderr, "which: %s is a shell built-in\n", cmd1.args[1]);
-                        prev_exit_status = 1;
-                    } else {
-                        char *path = find_executable(cmd1.args[1]);
-                        if (path) {
-                            printf("%s\n", path);
-                            free(path);
-                            prev_exit_status = 0;
-                        } else {
-                            fprintf(stderr, "which: %s not found\n", cmd1.args[1]);
-                            prev_exit_status = 1;
-                        }
-                    }
-                }
-                continue;
-            }
-            if (strcmp(cmd1.args[0], "exit") == 0) {
-                if (interactive)
-                    printf("Exiting my shell, goodbye!\n");
-                exit(EXIT_SUCCESS);
-            }
-            if (strcmp(cmd1.args[0], "die") == 0) {
-                for (int i = 1; cmd1.args[i] != NULL; i++) {
-                    fprintf(stderr, "%s ", cmd1.args[i]);
-                }
-                fprintf(stderr, "\n");
-                exit(EXIT_FAILURE);
-            }
+        if (cmd1.args[0] == NULL) {
+            free_command(&cmd1);
+            free_command(&cmd2);
+            continue;
         }
         
-        /* Special case: pipeline with built-in exit/die as second command.
-           For example, "echo hello | exit" should run echo hello, then exit. */
         int status = 0;
-        if (pipe_index != -1 && cmd2.args[0] != NULL &&
-            (strcmp(cmd2.args[0], "exit") == 0 || strcmp(cmd2.args[0], "die") == 0)) {
-            status = execute_command(&cmd1);
-            prev_exit_status = status;
-            if (strcmp(cmd2.args[0], "exit") == 0) {
-                if (interactive) {
-                    printf("Exiting my shell, goodbye!\n");
-                }
-                exit(EXIT_SUCCESS);
+        if (pipe_index == -1 && is_builtin(cmd1.args[0])) {
+            int saved[2] = {-1, -1};
+            if (redirect_builtin(&cmd1, saved) != 0) {
+                prev_exit_status = 1;
             } else {
-                for (int i = 1; cmd2.args[i] != NULL; i++) {
-                    fprintf(stderr, "%s ", cmd2.args[i]);
+                status = run_builtin(&cmd1);
+                fflush(stdout);
+                if (status == 100) {
+                    if (interactive) printf("Exiting my shell, goodbye!\n");
+                    restore_builtin(saved);
+                    free_command(&cmd1);
+                    exit(EXIT_SUCCESS);
                 }
-                fprintf(stderr, "\n");
-                exit(EXIT_FAILURE);
+                if (status == 101) {
+                    restore_builtin(saved);
+                    free_command(&cmd1);
+                    exit(EXIT_FAILURE);
+                }
+                restore_builtin(saved);
+                prev_exit_status = status;
             }
         } else {
             if (pipe_index != -1) {
                 status = execute_pipeline(&cmd1, &cmd2);
+                if (strcmp(cmd1.args[0], "exit") == 0 || strcmp(cmd2.args[0], "exit") == 0) {
+                    if (interactive) printf("Exiting my shell, goodbye!\n");
+                    free_command(&cmd1);
+                    free_command(&cmd2);
+                    exit(EXIT_SUCCESS);
+                }
+                if (strcmp(cmd1.args[0], "die") == 0 || strcmp(cmd2.args[0], "die") == 0) {
+                    free_command(&cmd1);
+                    free_command(&cmd2);
+                    exit(EXIT_FAILURE);
+                }
             } else {
                 status = execute_command(&cmd1);
             }
@@ -373,6 +394,8 @@ void run_shell(FILE *input_stream, int interactive) {
         if (interactive && print_newline) {
             printf("\n");
         }
+        free_command(&cmd1);
+        free_command(&cmd2);
     }
     
     if (interactive) {
@@ -388,16 +411,137 @@ void trim_newline(char *str) {
     }
 }
 
+static int read_command_line(int fd, char *line, size_t size) {
+    size_t used = 0;
+    char ch;
+    int too_long = 0;
+    while (used + 1 < size) {
+        ssize_t n = read(fd, &ch, 1);
+        if (n == 0) {
+            if (used == 0) return 0;
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (ch == '\n') break;
+        line[used++] = ch;
+    }
+    if (used + 1 == size) {
+        while (1) {
+            ssize_t n = read(fd, &ch, 1);
+            if (n == 0) break;
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            if (ch == '\n') break;
+            too_long = 1;
+        }
+    }
+    line[used] = '\0';
+    return too_long ? -2 : 1;
+}
+
+static int append_arg(command *cmd, char *arg, int *index, int owned) {
+    if (*index >= MAX_ARGS - 1) return 0;
+    cmd->args[(*index)++] = arg;
+    cmd->args[*index] = NULL;
+    if (owned) cmd->owned_args[cmd->owned_count++] = arg;
+    return 1;
+}
+
+static int redirect_builtin(const command *cmd, int saved[2]) {
+    fflush(stdout);
+    if (cmd->input_file) {
+        int fd = open(cmd->input_file, O_RDONLY);
+        if (fd < 0) { perror("open input_file"); return 1; }
+        saved[0] = dup(STDIN_FILENO);
+        if (saved[0] < 0 || dup2(fd, STDIN_FILENO) < 0) {
+            perror("dup2");
+            close(fd);
+            if (saved[0] >= 0) close(saved[0]);
+            saved[0] = -1;
+            return 1;
+        }
+        close(fd);
+    }
+    if (cmd->output_file) {
+        int fd = open(cmd->output_file, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+        if (fd < 0) { perror("open output_file"); restore_builtin(saved); return 1; }
+        saved[1] = dup(STDOUT_FILENO);
+        if (saved[1] < 0 || dup2(fd, STDOUT_FILENO) < 0) {
+            perror("dup2");
+            close(fd);
+            if (saved[1] >= 0) close(saved[1]);
+            saved[1] = -1;
+            restore_builtin(saved);
+            return 1;
+        }
+        close(fd);
+    }
+    return 0;
+}
+
+static void restore_builtin(int saved[2]) {
+    fflush(stdout);
+    if (saved[0] >= 0) { dup2(saved[0], STDIN_FILENO); close(saved[0]); saved[0] = -1; }
+    if (saved[1] >= 0) { dup2(saved[1], STDOUT_FILENO); close(saved[1]); saved[1] = -1; }
+}
+
+static void free_command(command *cmd) {
+    for (int i = 0; i < cmd->owned_count; i++) free(cmd->owned_args[i]);
+    cmd->owned_count = 0;
+}
+
+static int is_builtin(const char *name) {
+    return strcmp(name, "cd") == 0 || strcmp(name, "pwd") == 0 ||
+           strcmp(name, "which") == 0 || strcmp(name, "exit") == 0 ||
+           strcmp(name, "die") == 0;
+}
+
+static int run_builtin(command *cmd) {
+    char **args = cmd->args;
+    if (strcmp(args[0], "cd") == 0) {
+        if (!args[1] || args[2]) { fprintf(stderr, "cd: requires one argument\n"); return 1; }
+        if (chdir(args[1]) < 0) { perror("cd"); return 1; }
+        return 0;
+    }
+    if (strcmp(args[0], "pwd") == 0) {
+        char cwd[1024];
+        if (args[1]) { fprintf(stderr, "pwd: takes no arguments\n"); return 1; }
+        if (!getcwd(cwd, sizeof(cwd))) { perror("pwd"); return 1; }
+        puts(cwd);
+        return 0;
+    }
+    if (strcmp(args[0], "which") == 0) {
+        if (!args[1] || args[2] || is_builtin(args[1])) return 1;
+        char *path = find_executable(args[1]);
+        if (!path) return 1;
+        puts(path);
+        free(path);
+        return 0;
+    }
+    if (strcmp(args[0], "exit") == 0) return 100;
+    for (int i = 1; args[i]; i++) fprintf(stderr, "%s%s", i == 1 ? "" : " ", args[i]);
+    fputc('\n', stderr);
+    return 101;
+}
+
 /*
  * Split a command line into tokens using whitespace.
- * If a token starts with '#' the rest of the line is ignored.
  */
 void tokenize_line(char *line, char *tokens[], int *num_tokens) {
+    char *comment = strchr(line, '#');
+    if (comment) *comment = '\0';
     char *token = strtok(line, " \t");
     *num_tokens = 0;
-    while (token != NULL && *num_tokens < MAX_TOKENS - 1) {
-        if (token[0] == '#') {
-            break;
+    while (token != NULL) {
+        if (*num_tokens >= MAX_TOKENS - 1) {
+            *num_tokens = MAX_TOKENS;
+            tokens[MAX_TOKENS - 1] = NULL;
+            return;
         }
         tokens[(*num_tokens)++] = token;
         token = strtok(NULL, " \t");
@@ -434,6 +578,7 @@ int execute_command(command *cmd) {
         return 1;
     }
     if (pid == 0) {
+        if (close_child_stdin && !cmd->input_file) close(STDIN_FILENO);
         if (cmd->input_file) {
             int fd_in = open(cmd->input_file, O_RDONLY);
             if (fd_in < 0) {
@@ -451,6 +596,11 @@ int execute_command(command *cmd) {
             }
             dup2(fd_out, STDOUT_FILENO);
             close(fd_out);
+        }
+        if (is_builtin(cmd->args[0])) {
+            int status = run_builtin(cmd);
+            fflush(NULL);
+            _exit(status == 100 ? 0 : status == 101 ? 1 : status);
         }
         if (strchr(cmd->args[0], '/') == NULL) {
             char *path = find_executable(cmd->args[0]);
@@ -485,6 +635,7 @@ int execute_pipeline(command *cmd1, command *cmd2) {
         perror("pipe");
         return 1;
     }
+    fflush(NULL);
     
     pid_t pid1 = fork();
     if (pid1 < 0) {
@@ -495,6 +646,7 @@ int execute_pipeline(command *cmd1, command *cmd2) {
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[0]);
         close(pipefd[1]);
+        if (close_child_stdin && !cmd1->input_file) close(STDIN_FILENO);
         if (cmd1->input_file) {
             int fd_in = open(cmd1->input_file, O_RDONLY);
             if (fd_in < 0) {
@@ -503,6 +655,17 @@ int execute_pipeline(command *cmd1, command *cmd2) {
             }
             dup2(fd_in, STDIN_FILENO);
             close(fd_in);
+        }
+        if (cmd1->output_file) {
+            int fd_out = open(cmd1->output_file, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+            if (fd_out < 0) { perror("open output_file"); _exit(EXIT_FAILURE); }
+            if (dup2(fd_out, STDOUT_FILENO) < 0) { perror("dup2"); _exit(EXIT_FAILURE); }
+            close(fd_out);
+        }
+        if (is_builtin(cmd1->args[0])) {
+            int result = run_builtin(cmd1);
+            fflush(NULL);
+            _exit(result == 100 ? 0 : result == 101 ? 1 : result);
         }
         if (strchr(cmd1->args[0], '/') == NULL) {
             char *path = find_executable(cmd1->args[0]);
@@ -534,6 +697,17 @@ int execute_pipeline(command *cmd1, command *cmd2) {
             }
             dup2(fd_out, STDOUT_FILENO);
             close(fd_out);
+        }
+        if (cmd2->input_file) {
+            int fd_in = open(cmd2->input_file, O_RDONLY);
+            if (fd_in < 0) { perror("open input_file"); _exit(EXIT_FAILURE); }
+            if (dup2(fd_in, STDIN_FILENO) < 0) { perror("dup2"); _exit(EXIT_FAILURE); }
+            close(fd_in);
+        }
+        if (is_builtin(cmd2->args[0])) {
+            int result = run_builtin(cmd2);
+            fflush(NULL);
+            _exit(result == 100 ? 0 : result == 101 ? 1 : result);
         }
         if (strchr(cmd2->args[0], '/') == NULL) {
             char *path = find_executable(cmd2->args[0]);
