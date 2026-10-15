@@ -1,8 +1,6 @@
-CS 214 Spring 2025 - Project III: My Shell
+## CS 214 Spring 2025 - Project III: My Shell
 
-Authors
-Aarya Kansara (ak2397)
-Subham Jena (sj1097)
+Authors: Aarya Kansara and Subham Jena
 
 mysh is a C shell that runs one command per line. It can read commands from a file or standard input, and it has an interactive prompt when run in a terminal.
 
